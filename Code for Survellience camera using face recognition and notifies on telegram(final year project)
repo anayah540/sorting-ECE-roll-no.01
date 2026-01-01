@@ -1,0 +1,471 @@
+import os
+import time
+import datetime
+from collections import deque
+import threading 
+from threading import Lock 
+
+import cv2
+import numpy as np
+from flask import Flask, Response, render_template
+
+# 🛑 NEW: Import Picamera2 for CSI Camera access
+from picamera2 import Picamera2 
+from deepface import DeepFace
+import requests
+
+# ================== CONFIG (OPTIMIZED FOR PI) ==================
+KNOWN_FACE_PATH   = "known_faces/me.jpg"
+MODEL_NAME        = "VGG-Face"        # ⬅️ OPTIMIZED: Lighter model than Facenet512
+DETECTOR_BACKEND  = "opencv"
+TARGET_WIDTH      = 480               # ⬅️ OPTIMIZED: Smaller frame size for faster processing
+TARGET_FPS        = 10                # ⬅️ OPTIMIZED: Start with a lower, more realistic FPS
+
+# Telegram (optional: leave empty to disable)
+BOT_TOKEN         = ""    
+CHAT_ID           = ""    
+
+# Eye-blink detection (Haar cascades bundled with OpenCV)
+FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+EYE_CASCADE  = cv2.CascadeClassifier(cv2.data.haascades + "haarcascade_eye_tree_eyeglasses.xml")
+
+# Anti-Spoofing Configuration (Liveness settings kept the same)
+SPOOF_MOVEMENT_THRESHOLD = 0.0008   
+REQUIRED_LIVENESS_CHECKS = 6 
+
+# EYE BLINK CONFIG
+BLINK_MEMORY_TIME = 5.0 
+EYE_ABSENCE_THRESHOLD = 0.5 
+MIN_EYE_DETECTIONS = 2 
+
+# Decision cadence
+CHECK_INTERVAL    = 0.5   
+ALERT_COOLDOWN    = 20.0  
+ALERT_LOCKOUT_TIME = 3.0  
+
+# Identity tolerance
+OWNER_THRESHOLD  = 0.61 
+
+# Threading state
+FRAME_TO_PROCESS = None
+PROCESSING_LOCK  = Lock()
+LAST_FACE_BOX    = None  
+PREV_FRAME_GRAY  = None 
+FACE_ABSENCE_COUNTER = 0
+
+SPOOF_STATIC_FRAMES = 0 
+distance_smooth = deque(maxlen=3)
+
+# ============================================
+
+app = Flask(__name__)
+
+# Globals (rest of globals remain the same)
+label_global     = "Warm-up"
+distance_global  = 9.99
+last_check_time  = 0.0
+last_alert_time  = 0.0
+face_reappeared_time = 0.0
+BLINK_DETECTED_FLAG  = False 
+LAST_BLINK_TIME = 0.0 
+NO_BLINK_OR_MOVEMENT_FRAMES = 0 
+
+
+# ---------- helpers (No changes needed) ----------
+
+def send_telegram_video(path, caption=""):
+    # ... (function body remains the same) ...
+    if not BOT_TOKEN or not CHAT_ID or not os.path.exists(path):
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+        with open(path, "rb") as f:
+            requests.post(
+                url,
+                data={"chat_id": CHAT_ID, "caption": caption},
+                files={"video": f},
+                timeout=20
+            )
+        print("[TG] video sent.")
+    except Exception as e:
+        print("[TG ERROR]", e)
+
+def record_clip(frames, fps=10, out_dir="videos"):
+    # ... (function body remains the same) ...
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join(out_dir, f"alert_{ts}.avi")
+    h, w = frames[0].shape[:2]
+    # NOTE: Using a lower FPS for clips to save resources
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"XVID"), fps, (w, h))
+    for fr in frames:
+        writer.write(fr)
+    writer.release()
+    return path
+
+def send_telegram_alert(label, distance, frames_for_clip):
+    # ... (function body remains the same) ...
+    global last_alert_time
+    now = time.time()
+    if not BOT_TOKEN or not CHAT_ID: 
+        return
+
+    if now - last_alert_time < ALERT_COOLDOWN:
+        return
+    last_alert_time = now
+
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    caption = f"{label} at {ts} (d={distance:.3f})"
+    try:
+        clip = record_clip(frames_for_clip) 
+        send_telegram_video(clip, caption)
+    except Exception as e:
+        print("[ALERT ERROR]", e)
+
+def ambient_light_ok(frame_gray):
+    # ... (function body remains the same) ...
+    mean_val = float(np.mean(frame_gray))
+    return mean_val, mean_val >= 60.0
+
+def calibrate_threshold(known_img_path):
+    # ... (function body remains the same) ...
+    print("[INFO] Calibrating threshold...")
+    distances = []
+    for _ in range(5):
+        try:
+            res = DeepFace.verify(
+                img1_path=known_img_path,
+                img2_path=known_img_path,
+                model_name=MODEL_NAME,
+                detector_backend=DETECTOR_BACKEND,
+                enforce_detection=False,
+            )
+            distances.append(res["distance"])
+        except Exception:
+            distances.append(0.35)
+    avg = float(np.mean(distances))
+    
+    # Tolerant threshold for owner: safety margin 0.30 and minimum bound 0.61 
+    thr = max(avg + 0.30, OWNER_THRESHOLD) 
+    
+    print(f"[INFO] Calibrated threshold = {thr:.3f} (avg self-dist={avg:.3f})")
+    return thr
+
+def check_for_blink(frame_gray, face_box):
+    # ... (function body remains the same) ...
+    fx, fy, fw, fh = face_box
+    eye_roi_h = int(fh * 0.55) 
+    eye_roi_y = fy + int(fh * 0.1) 
+    
+    face_roi_for_eyes = frame_gray[eye_roi_y : eye_roi_y + eye_roi_h, fx : fx + fw]
+    
+    if face_roi_for_eyes.size == 0:
+        return False, 0
+
+    eyes = EYE_CASCADE.detectMultiScale(
+        face_roi_for_eyes, 
+        scaleFactor=1.1, 
+        minNeighbors=5, 
+        minSize=(int(fw*0.1), int(fh*0.05)),
+        maxSize=(int(fw*0.45), int(fh*0.3)) 
+    )
+    
+    valid_eyes = 0
+    max_eye_area = (fw * fh) * EYE_ABSENCE_THRESHOLD
+    for (_, _, ew, eh) in eyes:
+        if (ew * eh) < max_eye_area:
+            valid_eyes += 1
+            
+    is_open = valid_eyes >= MIN_EYE_DETECTIONS 
+    
+    return is_open, valid_eyes
+
+# ---------- DeepFace Verification Worker Thread (No changes needed) ----------
+
+def verification_worker():
+    global label_global, distance_global, last_check_time, OWNER_THRESHOLD, FRAME_TO_PROCESS, LAST_FACE_BOX, PREV_FRAME_GRAY, FACE_ABSENCE_COUNTER, face_reappeared_time, SPOOF_STATIC_FRAMES, BLINK_DETECTED_FLAG, LAST_BLINK_TIME, NO_BLINK_OR_MOVEMENT_FRAMES
+
+    blink_state = 0 
+
+    if os.path.exists(KNOWN_FACE_PATH):
+        OWNER_THRESHOLD = calibrate_threshold(KNOWN_FACE_PATH)
+    else:
+        print("[WARN] Known face image not found. Put one at:", KNOWN_FACE_PATH)
+        return 
+
+    while True:
+        time_to_wait = CHECK_INTERVAL - (time.time() - last_check_time)
+        if time_to_wait > 0:
+            time.sleep(time_to_wait)
+        
+        frame_copy = None
+        face_box_copy = None
+        
+        with PROCESSING_LOCK:
+            if FRAME_TO_PROCESS is not None and LAST_FACE_BOX is not None:
+                frame_copy = FRAME_TO_PROCESS.copy()
+                face_box_copy = LAST_FACE_BOX.copy()
+            else:
+                last_check_time = time.time()
+                FACE_ABSENCE_COUNTER += 1 
+                NO_BLINK_OR_MOVEMENT_FRAMES = 0 
+                blink_state = 0 
+                continue
+
+        dist = distance_global
+        label_for_update = label_global
+        verification_success = False
+        now = time.time()
+        
+        try:
+            gray = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
+            light_val, good_light = ambient_light_ok(gray)
+            
+            x, y, w, h = face_box_copy
+            face_roi_gray = gray[y:y+h, x:x+w]
+            
+            if FACE_ABSENCE_COUNTER > 3: 
+                distance_smooth.clear()
+                face_reappeared_time = now
+                blink_state = 0 
+            FACE_ABSENCE_COUNTER = 0 
+
+            # --- ANTI-SPOOFING (Frame Difference) ---
+            motion_detected = False
+            
+            if PREV_FRAME_GRAY is not None:
+                prev_face_roi = PREV_FRAME_GRAY.copy() 
+
+                if prev_face_roi.shape == face_roi_gray.shape:
+                    diff = cv2.absdiff(face_roi_gray, prev_face_roi) 
+                    mean_diff = np.mean(diff)
+                    
+                    if mean_diff > SPOOF_MOVEMENT_THRESHOLD:
+                        motion_detected = True
+                        
+                    print(f"[Worker] Mean Diff: {mean_diff:.4f}")
+                
+            PREV_FRAME_GRAY = face_roi_gray.copy()
+            # --- END ANTI-SPOOFING ---
+            
+            # 🆕 EYE BLINK DETECTION LOGIC
+            eyes_open, _ = check_for_blink(gray, face_box_copy)
+            
+            if eyes_open:
+                if blink_state == 1: 
+                    blink_state = 2
+                    BLINK_DETECTED_FLAG = True
+                    LAST_BLINK_TIME = now
+                    print("[LIVENESS] ** BLINK DETECTED **")
+                elif blink_state == 2: 
+                    blink_state = 0
+                else:
+                    blink_state = 0
+            else:
+                blink_state = 1 
+            
+            if now - LAST_BLINK_TIME > BLINK_MEMORY_TIME:
+                BLINK_DETECTED_FLAG = False
+
+            # 🆕 UNIFIED LIVENESS COUNTER LOGIC
+            liveness_absent = (not motion_detected) and (not BLINK_DETECTED_FLAG)
+
+            if liveness_absent:
+                NO_BLINK_OR_MOVEMENT_FRAMES += 1
+            else:
+                NO_BLINK_OR_MOVEMENT_FRAMES = 0 
+
+            is_liveness_timeout = NO_BLINK_OR_MOVEMENT_FRAMES >= REQUIRED_LIVENESS_CHECKS
+            
+            # 3. Run DeepFace 
+            dyn_thr = OWNER_THRESHOLD + (0.15 if not good_light else 0.0) 
+            
+            res = DeepFace.verify(
+                frame_copy, KNOWN_FACE_PATH,
+                model_name=MODEL_NAME,
+                detector_backend=DETECTOR_BACKEND,
+                enforce_detection=False
+            )
+            dist = float(res["distance"])
+            verification_success = True
+            
+            # 4. Determine Label
+            if verification_success:
+                
+                distance_smooth.append(dist) 
+                dist_avg = float(np.mean(distance_smooth))
+
+                if dist_avg <= dyn_thr:
+                    
+                    if is_liveness_timeout:
+                        label_for_update = "Spoof"
+                    else:
+                        label_for_update = "Owner"
+                else:
+                    label_for_update = "Unknown"
+        
+        except Exception as e:
+            # print(f"[VERIFY ERROR] DeepFace failed: {e}") # Keep this line commented unless debugging
+            label_for_update = "Unknown (Error)"
+            FACE_ABSENCE_COUNTER += 1 
+
+
+        # 5. Update global state safely and report
+        with PROCESSING_LOCK:
+            if verification_success:
+                distance_global = dist_avg
+                label_global = label_for_update
+            else:
+                label_global = label_for_update
+
+            liveness_status = f"Blink: {'YES' if BLINK_DETECTED_FLAG else 'NO'} | Liveness Absent: {NO_BLINK_OR_MOVEMENT_FRAMES}/{REQUIRED_LIVENESS_CHECKS}"
+            print(f"Distance: {distance_global:.3f} | Threshold: {dyn_thr:.3f} | Label: {label_global} | Liveness: {liveness_status}")
+
+            # 6. Alerting (Grace Period Check)
+            is_in_grace_period = (now - face_reappeared_time) < ALERT_LOCKOUT_TIME
+
+            if label_global in ("Unknown", "Spoof") and not is_in_grace_period:
+                send_telegram_alert(f"{label_global}", distance_global, [frame_copy])
+                
+            last_check_time = now
+        
+# -----------------------------------------------------------------
+
+# ---------- camera + stream (MODIFIED) ----------
+
+def open_camera():
+    """Initializes and configures the Raspberry Pi Camera Module V2 using Picamera2."""
+    print("[INFO] Initializing Picamera2...")
+    picam2 = Picamera2()
+    
+    # Configure the camera resolution and format
+    # Using 1280x720 for capture (will be resized down to TARGET_WIDTH in generate_frames)
+    camera_config = picam2.create_video_configuration(
+        main={"size": (1280, 720), "format": "BGR888"}
+    )
+    picam2.configure(camera_config)
+    picam2.start()
+    
+    # Wait a moment for the camera to warm up
+    time.sleep(2) 
+    return picam2
+
+# Initialize the camera globally
+camera = open_camera()
+
+
+def generate_frames():
+    global label_global, distance_global, FRAME_TO_PROCESS, LAST_FACE_BOX, BLINK_DETECTED_FLAG
+
+    clip_buffer = deque(maxlen=TARGET_FPS * 4)
+
+    t_next = time.time()
+    seconds_per_frame = 1.0 / TARGET_FPS
+    
+    # Use the globally initialized Picamera2 object
+    picam2 = camera
+
+    while True:
+        # 🛑 UPDATED: Capture frame from Picamera2 object
+        frame = picam2.capture_array() 
+        ok = frame is not None
+        
+        if not ok:
+            print("⚠️ Camera frame not received")
+            time.sleep(0.2)
+            continue
+
+        h, w = frame.shape[:2]
+        
+        # Resize to TARGET_WIDTH for all processing and display
+        scale = TARGET_WIDTH / max(1, w)
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        disp = frame.copy()
+
+        now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        light_val, good_light = ambient_light_ok(gray)
+
+        faces = FACE_CASCADE.detectMultiScale(gray, 1.12, 5, minSize=(80, 80))
+        
+        # Pass the frame to the worker thread
+        with PROCESSING_LOCK:
+            FRAME_TO_PROCESS = frame.copy() 
+            if len(faces) > 0:
+                LAST_FACE_BOX = faces[0].tolist() 
+            else:
+                LAST_FACE_BOX = None
+        
+        # Color logic to quickly show status (Same as before)
+        if label_global == "Owner" and BLINK_DETECTED_FLAG:
+            color = (255, 255, 0)
+        elif label_global == "Owner":
+             color = (0, 255, 0)
+        elif label_global == "Spoof":
+            color = (0, 165, 255)
+        else:
+            color = (0, 0, 255)
+        
+        if LAST_FACE_BOX:
+            x, y, w, h = LAST_FACE_BOX
+            cv2.rectangle(disp, (x, y), (x + w, y + h), color, 2)
+            
+            if BLINK_DETECTED_FLAG:
+                 cv2.putText(disp, "BLINK OK", (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
+
+        cv2.putText(disp, f"{label_global}  d={distance_global:.3f}", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+        cv2.putText(disp, now_ts, (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+
+        if not good_light:
+            cv2.putText(disp, f"Low light ({light_val:.0f}) - move to brighter area",
+                        (10, disp.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+
+        clip_buffer.append(disp.copy())
+
+        ok, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            continue
+        frame_bytes = buf.tobytes()
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+
+        t_next += seconds_per_frame
+        sleep = t_next - time.time()
+        if sleep > 0:
+            time.sleep(sleep)
+        else:
+            t_next = time.time()
+
+# ---------- routes (No changes needed) ----------
+
+@app.route("/")
+def index():
+    return """
+    <html>
+        <head>
+            <title>Face Recognition and Liveness</title>
+        </head>
+        <body>
+            <h1>Live Video Feed</h1>
+            <img src="/video_feed" width="480">
+        </body>
+    </html>
+    """
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ---------- main (No changes needed) ----------
+
+if __name__ == "__main__":
+    worker = threading.Thread(target=verification_worker, daemon=True)
+    worker.start()
+
+    print("[INFO] Model:", MODEL_NAME, "| Detector:", DETECTOR_BACKEND)
+    print("[INFO] Known face at:", KNOWN_FACE_PATH)
+    
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True) # Changed host to 0.0.0.0 to be accessible remotely
